@@ -2,6 +2,23 @@
 #export VLLM_ATTENTION_BACKEND=XFORMERS
 unset VLLM_ATTENTION_BACKEND
 export VLLM_USE_V1=1
+export CUDA_VISIBLE_DEVICES=4,5,6,7
+
+# ========================================
+# 环境配置
+# ========================================
+# HuggingFace 配置
+export HF_ENDPOINT=https://hf-mirror.com
+export HUGGINGFACENAME="123YYY123"
+export HF_TOKEN="YOUR_HF_TOKEN"
+echo "✓ HuggingFace 镜像: $HF_ENDPOINT"
+echo "✓ HuggingFace 用户名: $HUGGINGFACENAME"
+
+# WandB 配置
+export WANDB_BASE_URL=https://api1.bandw.top
+export WANDB_API_KEY="YOUR_WANDB_API_KEY"
+echo "✓ WandB 镜像: $WANDB_BASE_URL"
+# ========================================
 
 # ------------------------------------------------------------
 
@@ -25,11 +42,13 @@ EPISODE=30
 DATA_TRAIN_BATCH_SIZE=8
 N_VOTES_PER_PROMPT=64
 N_SAMPLES_PER_PROMPT=32
+MAX_TRAIN_SAMPLES_PER_BATCH=$((DATA_TRAIN_BATCH_SIZE * N_SAMPLES_PER_PROMPT))  # 8 * 32 = 256
 MINI_BATCH_SIZE=1
 MICRO_BATCH_SIZE=2
 
-DATA_LOCAL_DIR="path/to/TTRL/verl/data"
-BACKBONE_PATH="path/to/${BACKBONE}"
+DATA_LOCAL_DIR="/data/user5/TTRL/verl/data"
+BACKBONE_PATH="/data/user5/models/${BACKBONE}"
+REWARD_FUNCTION_PATH="/data/user5/TTRL/verl/verl/utils/reward_score/ttrl_math/__init__.py"
 
 MODEL="${TASK}-${BACKBONE}"
 EXPERIMENT="TTRL-Len@${K}k"
@@ -69,7 +88,7 @@ python -m verl.trainer.main_ppo \
   actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=$MICRO_BATCH_SIZE \
   actor_rollout_ref.rollout.tensor_model_parallel_size=1 \
   actor_rollout_ref.rollout.gpu_memory_utilization=0.8 \
-  actor_rollout_ref.rollout.n=$N_SAMPLES_PER_PROMPT \
+  actor_rollout_ref.rollout.n=$N_VOTES_PER_PROMPT \
   actor_rollout_ref.rollout.val_kwargs.do_sample=True \
   actor_rollout_ref.rollout.val_kwargs.n=$N \
   actor_rollout_ref.rollout.val_kwargs.top_p=0.95 \
@@ -85,21 +104,22 @@ python -m verl.trainer.main_ppo \
   critic.model.fsdp_config.optimizer_offload=False \
   algorithm.kl_ctrl.kl_coef=0.00 \
   algorithm.adv_estimator=$ADVANTAGE \
-  custom_reward_function.path="./verl/utils/reward_score/ttrl_math/__init__.py" \
+  custom_reward_function.path="$REWARD_FUNCTION_PATH" \
   custom_reward_function.name=reward_func \
   ttrl.enable=True \
-  ttrl.n_votes_per_prompt=$N_VOTES_PER_PROMPT \
-  ttrl.n_samples_per_prompt=$N_SAMPLES_PER_PROMPT \
   trainer.logger=['console','wandb'] \
   trainer.project_name=$WANDB_PROJECT \
   trainer.experiment_name=$LOG_NAME \
-  trainer.n_gpus_per_node=8 \
+  trainer.n_gpus_per_node=4 \
   trainer.nnodes=1 \
   trainer.save_freq=2000000 \
   trainer.test_freq=2 \
   trainer.max_actor_ckpt_to_keep=0 \
   trainer.max_critic_ckpt_to_keep=0 \
   trainer.default_local_dir=$OUTPUT_DIR \
+  ++trainer.filter_reasoning_steps=15 \
+  ++trainer.max_train_samples_per_batch=$MAX_TRAIN_SAMPLES_PER_BATCH \
+  ++trainer.compute_entropy_for_reward=True \
   trainer.total_epochs=$EPISODE "$@"
 
 echo "Output directory: $OUTPUT_DIR"

@@ -77,6 +77,64 @@ def _compute_response_info(batch: DataProto) -> Dict[str, Any]:
     )
 
 
+def compute_policy_entropy_metrics(batch: DataProto) -> Dict[str, Any]:
+    """
+    Computes policy entropy metrics according to the formula:
+    H(π_θ, D) = -E_{D,π_θ}[log π_θ(y_t|y_{<t})] = -1/|D| Σ_{x∈D} 1/|y| Σ_{i=1}^{|y|} E_{y_t~π_θ}[log π_θ(y_t|y_{<t}, x)]
+    
+    This function calculates token-level entropy of the policy model on generated responses.
+    The entropy quantifies the uncertainty level of the policy on current prompts and is widely
+    adopted in maximum entropy RL as a regularization term.
+    
+    Args:
+        batch: A DataProto object containing batch data with entropy values from compute_log_prob.
+    
+    Returns:
+        A dictionary of policy entropy metrics including:
+            - policy_entropy/token/mean: Mean entropy per token across all valid response tokens
+            - policy_entropy/sequence/mean: Mean entropy per sequence (averaged over response length)
+            - policy_entropy/token/std: Standard deviation of token-level entropy
+            - policy_entropy/sequence/max: Maximum sequence-level entropy
+            - policy_entropy/sequence/min: Minimum sequence-level entropy
+    
+    Note:
+        This implementation follows the policy entropy definition from:
+        "Entropy Mechanism of Reinforcement Learning" and standard maximum entropy RL literature.
+    """
+    if "entropys" not in batch.batch:
+        return {}
+    
+    entropys = batch.batch["entropys"]  # (batch_size, response_length)
+    response_mask = batch.batch["response_mask"].bool()  # (batch_size, response_length)
+    
+    # Token-level metrics: compute mean and std over all valid tokens
+    # This corresponds to: 1/|D| Σ_{x∈D} 1/|y| Σ_{i=1}^{|y|} H(π_θ(·|y_{<i}, x))
+    valid_entropys = torch.masked_select(entropys, response_mask)
+    token_mean_entropy = torch.mean(valid_entropys).detach().item()
+    token_std_entropy = torch.std(valid_entropys).detach().item()
+    
+    # Sequence-level metrics: average entropy per sequence, then compute statistics
+    # First compute mean entropy for each sequence
+    response_length = response_mask.sum(dim=-1).float()  # (batch_size,)
+    sequence_entropy_sum = (entropys * response_mask.float()).sum(dim=-1)  # (batch_size,)
+    sequence_mean_entropy = sequence_entropy_sum / (response_length + 1e-8)  # (batch_size,)
+    
+    sequence_mean_entropy_avg = torch.mean(sequence_mean_entropy).detach().item()
+    sequence_mean_entropy_max = torch.max(sequence_mean_entropy).detach().item()
+    sequence_mean_entropy_min = torch.min(sequence_mean_entropy).detach().item()
+    
+    return {
+        # actor/entropy 与 policy_entropy/token/mean 使用完全相同的数据和公式，
+        # 保证两者在 WandB 上始终相等，消除因 batch 来源或聚合方式不同导致的差异。
+        "actor/entropy": token_mean_entropy,
+        "policy_entropy/token/mean": token_mean_entropy,
+        "policy_entropy/token/std": token_std_entropy,
+        "policy_entropy/sequence/mean": sequence_mean_entropy_avg,
+        "policy_entropy/sequence/max": sequence_mean_entropy_max,
+        "policy_entropy/sequence/min": sequence_mean_entropy_min,
+    }
+
+
 def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> Dict[str, Any]:
     """
     Computes various metrics from a batch of data for PPO training.
@@ -100,6 +158,7 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> Dict[str,
             - response_length/mean, max, min, clip_ratio: Statistics about response lengths
             - prompt_length/mean, max, min, clip_ratio: Statistics about prompt lengths
             - num_turns/mean, max, min: Statistics about the number of multi-turn conversations
+            - policy_entropy/*: Policy entropy metrics (if entropy data available)
     """
     sequence_score = batch.batch["token_level_scores"].sum(-1)
     sequence_reward = batch.batch["token_level_rewards"].sum(-1)
@@ -176,6 +235,10 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> Dict[str,
         metrics["num_turns/min"] = num_turns.min()
         metrics["num_turns/max"] = num_turns.max()
         metrics["num_turns/mean"] = num_turns.mean()
+    
+    # policy entropy metrics (if available)
+    entropy_metrics = compute_policy_entropy_metrics(batch)
+    metrics.update(entropy_metrics)
 
     return metrics
 

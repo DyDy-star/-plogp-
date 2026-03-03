@@ -580,7 +580,8 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
         data.meta_info["use_dynamic_bsz"] = self.config.ref.log_prob_use_dynamic_bsz
         data.meta_info["temperature"] = self.config.rollout.temperature
         data = data.to(get_device_id())
-        output, _ = self.ref_policy.compute_log_prob(data=data, calculate_entropy=False)
+        ref_result = self.ref_policy.compute_log_prob(data=data, calculate_entropy=False)
+        output = ref_result[0]  # 兼容 2/3/4 个返回值
         output = DataProto.from_dict(tensors={"ref_log_prob": output})
         output = output.to("cpu")
         if self._ref_is_offload_param:
@@ -603,11 +604,36 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
         data.meta_info["use_dynamic_bsz"] = self.config.rollout.log_prob_use_dynamic_bsz
         data.meta_info["temperature"] = self.config.rollout.temperature
         data = data.to(get_device_id())
-        output, entropys = self.actor.compute_log_prob(data=data, calculate_entropy=True)
+        result = self.actor.compute_log_prob(data=data, calculate_entropy=True)
+        # 兼容 dp_actor 返回 5 个值和 megatron_actor 返回 2 个值
+        st_token_weights = None
+        if len(result) == 5:
+            output, entropys, step_efficiency, step_transitions, st_token_weights = result
+        elif len(result) == 4:
+            output, entropys, step_efficiency, step_transitions = result
+        elif len(result) == 3:
+            output, entropys, step_efficiency = result
+            step_transitions = None
+        else:
+            output, entropys = result
+            step_efficiency = None
+            step_transitions = None
+        tensors = {"old_log_probs": output, "entropys": entropys}
+        if step_efficiency is not None:
+            tensors["step_efficiency"] = step_efficiency
+        if st_token_weights is not None:
+            tensors["st_token_weights"] = st_token_weights
         output = DataProto.from_dict(
-            tensors={"old_log_probs": output, "entropys": entropys},
+            tensors=tensors,
             meta_info={"temperature": self.config.rollout.temperature},
         )
+        if step_transitions is not None:
+            import numpy as np
+            n = len(step_transitions)
+            arr = np.empty(n, dtype=object)
+            for idx in range(n):
+                arr[idx] = step_transitions[idx]
+            output.non_tensor_batch["step_transitions"] = arr
         output = output.to("cpu")
         # clear kv cache
         if self._is_offload_param:

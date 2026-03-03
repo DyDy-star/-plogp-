@@ -3,6 +3,12 @@
 unset VLLM_ATTENTION_BACKEND
 export VLLM_USE_V1=1
 
+# ========== WandB 配置 ==========
+export WANDB_BASE_URL=https://api1.bandw.top
+export WANDB_API_KEY="YOUR_WANDB_API_KEY"
+echo "✓ WandB 已配置: $WANDB_BASE_URL"
+# ===============================
+
 # ------------------------------------------------------------
 
 DATE=$(date +%m%d)

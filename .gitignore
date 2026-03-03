@@ -1,0 +1,30 @@
+# Checkpoints & model weights
+verl/checkpoints/
+verl/examples/ttrl/Qwen2.5-Math/checkpoints/
+verl/examples/ttrl/LLaMA3.1-Instruct/checkpoints/
+
+# WandB logs
+verl/wandb/
+verl/examples/ttrl/Qwen2.5-Math/wandb/
+
+# Evaluation results (large JSON files)
+verl/examples/ttrl/Qwen2.5-Math/eval_results_*/
+verl/examples/ttrl/Qwen2.5-Math/eval_results_aime_step240_fixed/
+verl/examples/ttrl/Qwen2.5-Math/grpo_analysis/
+
+# Training outputs
+verl/outputs/
+verl/examples/ttrl/Qwen2.5-Math/outputs/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+verl/verl.egg-info/
+
+# Binary / large files
+*.whl
+*.pdf
+
+# Fonts
+verl/examples/ttrl/Qwen2.5-Math/fonts/

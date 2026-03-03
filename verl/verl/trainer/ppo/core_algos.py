@@ -213,6 +213,10 @@ def compute_grpo_outcome_advantage(
     Compute advantage for GRPO, operating only on Outcome reward
     (with only one scalar reward for each response).
 
+    All responses (including truncated ones without EOS) participate in
+    group statistics.  Truncated responses naturally get reward=0 and
+    therefore receive negative advantages.
+
     Args:
         token_level_rewards: `(torch.Tensor)`
             shape is (bs, response_length)
@@ -229,25 +233,24 @@ def compute_grpo_outcome_advantage(
         Returns: `(torch.Tensor)`
             shape is (bs, response_length)
     """
-    scores = token_level_rewards.sum(dim=-1)
+    scores = (token_level_rewards * response_mask).sum(dim=-1)
 
-    id2score = defaultdict(list)
+    id2scores = defaultdict(list)
     id2mean = {}
     id2std = {}
 
     with torch.no_grad():
         bsz = scores.shape[0]
         for i in range(bsz):
-            id2score[index[i]].append(scores[i])
-        for idx in id2score:
-            if len(id2score[idx]) == 1:
+            id2scores[index[i]].append(scores[i])
+        for idx, group_scores in id2scores.items():
+            if len(group_scores) <= 1:
                 id2mean[idx] = torch.tensor(0.0)
                 id2std[idx] = torch.tensor(1.0)
-            elif len(id2score[idx]) > 1:
-                id2mean[idx] = torch.mean(torch.tensor(id2score[idx]))
-                id2std[idx] = torch.std(torch.tensor([id2score[idx]]))
             else:
-                raise ValueError(f"no score in prompt index: {idx}")
+                t = torch.stack(group_scores)
+                id2mean[idx] = t.mean()
+                id2std[idx] = t.std()
         for i in range(bsz):
             if norm_adv_by_std_in_grpo:
                 scores[i] = (scores[i] - id2mean[index[i]]) / (id2std[index[i]] + epsilon)
@@ -581,8 +584,12 @@ def agg_loss(loss_mat: torch.Tensor, loss_mask: torch.Tensor, loss_agg_mode: str
         seq_losses = torch.sum(loss_mat * loss_mask, dim=-1)  # token-sum
         loss = torch.mean(seq_losses)  # seq-mean
     elif loss_agg_mode == "seq-mean-token-mean":
-        seq_losses = torch.sum(loss_mat * loss_mask, dim=-1) / torch.sum(loss_mask, dim=-1)  # token-mean
-        loss = torch.mean(seq_losses)  # seq-mean
+        token_counts = torch.sum(loss_mask, dim=-1)  # (bs,)
+        # 安全除法: 截断遮罩可能导致某些响应的 mask 全零
+        seq_losses = torch.sum(loss_mat * loss_mask, dim=-1) / token_counts.clamp(min=1)  # token-mean
+        # 仅对有效响应 (token_counts > 0) 计算均值
+        valid_seq = token_counts > 0
+        loss = seq_losses[valid_seq].mean() if valid_seq.any() else torch.tensor(0.0, device=loss_mat.device)  # seq-mean
     elif loss_agg_mode == "seq-mean-token-sum-norm":
         seq_losses = torch.sum(loss_mat * loss_mask, dim=-1)
         loss = torch.sum(seq_losses) / loss_mask.shape[-1]  # The divisor

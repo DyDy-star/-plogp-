@@ -59,7 +59,7 @@ python -m verl.trainer.main_ppo \
   actor_rollout_ref.actor.optim.lr_warmup_steps_ratio=0.03 \
   actor_rollout_ref.actor.optim.warmup_style='cosine' \
   actor_rollout_ref.actor.fsdp_config.param_offload=False \
-  actor_rollout_ref.actor.fsdp_config.optimizer_offload=False \
+  actor_rollout_ref.actor.fsdp_config.optimizer_offload=True \
   actor_rollout_ref.actor.ppo_max_token_len_per_gpu=$((MAX_PROMPT_LENGTH + MAX_RESPONSE_LENGTH)) \
   actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=$MICRO_BATCH_SIZE \
   actor_rollout_ref.ref.fsdp_config.param_offload=True \

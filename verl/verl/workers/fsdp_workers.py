@@ -697,7 +697,8 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
 
             lr = self.actor_lr_scheduler.get_last_lr()[0]
             metrics["actor/lr"] = lr
-            self.actor_lr_scheduler.step()
+            if data.meta_info.get("step_lr", True):
+                self.actor_lr_scheduler.step()
 
             # TODO: here, we should return all metrics
             output = DataProto(meta_info={"metrics": metrics})
@@ -781,11 +782,26 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         with self.ulysses_sharding_manager:
             data = self.ulysses_sharding_manager.preprocess_data(data)
             with adapter_ctx:
-                output, entropys = self.actor.compute_log_prob(data=data, calculate_entropy=True)
+                output, entropys, step_efficiency, step_transitions, st_token_weights = self.actor.compute_log_prob(data=data, calculate_entropy=True)
+            tensors = {"old_log_probs": output, "entropys": entropys}
+            if step_efficiency is not None:
+                tensors["step_efficiency"] = step_efficiency
+            if st_token_weights is not None:
+                tensors["st_token_weights"] = st_token_weights
             output = DataProto.from_dict(
-                tensors={"old_log_probs": output, "entropys": entropys},
+                tensors=tensors,
                 meta_info={"temperature": self.config.rollout.temperature},
             )
+            # 将步间转移数据存入 non_tensor_batch (用于熵效率奖励计算)
+            # 必须强制创建 1D object array，避免 np.array() 自动推断为 2D
+            # (当所有内层 list 长度相同时会变成 2D，导致 DataProto.concat 维度不一致)
+            if step_transitions is not None:
+                import numpy as np
+                n = len(step_transitions)
+                arr = np.empty(n, dtype=object)
+                for idx in range(n):
+                    arr[idx] = step_transitions[idx]
+                output.non_tensor_batch["step_transitions"] = arr
             output = self.ulysses_sharding_manager.postprocess_data(output)
 
         output = output.to("cpu")
@@ -822,9 +838,11 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         data.meta_info["temperature"] = self.config.rollout.temperature
         data.meta_info["max_token_len"] = self.config.ref.log_prob_max_token_len_per_gpu
         data.meta_info["use_dynamic_bsz"] = self.config.ref.log_prob_use_dynamic_bsz
+        # Disable step-level peak ratio computation for ref model (not needed)
+        data.meta_info["compute_step_js"] = False
         with self.ulysses_sharding_manager:
             data = self.ulysses_sharding_manager.preprocess_data(data)
-            output, _ = self.ref_policy.compute_log_prob(data=data, calculate_entropy=False)
+            output, _, _, _, _ = self.ref_policy.compute_log_prob(data=data, calculate_entropy=False)
             output = DataProto.from_dict(tensors={"ref_log_prob": output})
             output = self.ulysses_sharding_manager.postprocess_data(output)
 

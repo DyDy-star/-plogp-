@@ -678,6 +678,16 @@ class RayPPOTrainer:
                 repeat_times=self.config.actor_rollout_ref.rollout.val_kwargs.n, interleave=True
             )
 
+            # ★ 修复: repeat() 导致 non_tensor_batch 中 dict 共享引用
+            for _key in ("extra_info", "reward_model"):
+                if _key in test_batch.non_tensor_batch:
+                    old_arr = test_batch.non_tensor_batch[_key]
+                    new_arr = np.empty(len(old_arr), dtype=object)
+                    for _i in range(len(old_arr)):
+                        v = old_arr[_i]
+                        new_arr[_i] = dict(v) if isinstance(v, dict) else v
+                    test_batch.non_tensor_batch[_key] = new_arr
+
             # we only do validation on rule-based rm
             if self.config.reward_model.enable and test_batch[0].non_tensor_batch["reward_model"]["style"] == "model":
                 return {}
@@ -746,11 +756,9 @@ class RayPPOTrainer:
             sample_scores.extend(scores)
 
             reward_extra_infos_dict["reward"].extend(scores)
-            print(f"len reward_extra_infos_dict['reward']: {len(reward_extra_infos_dict['reward'])}")
             if "reward_extra_info" in result:
                 for key, lst in result["reward_extra_info"].items():
                     reward_extra_infos_dict[key].extend(lst)
-                    print(f"len reward_extra_infos_dict['{key}']: {len(reward_extra_infos_dict[key])}")
 
             # collect num_turns of each prompt
             if "__num_turns__" in test_batch.non_tensor_batch:
@@ -1135,24 +1143,77 @@ class RayPPOTrainer:
                     # generate a batch
                     with marked_timer("gen", timing_raw, color="red"):
                         if self.config.get("ttrl", {}).get("enable", False):
-                            from verl.trainer.ppo.ttrl_utils import select_top_k_per_prompt, apply_ttrl_gt
+                            from verl.trainer.ppo.ttrl_utils import select_top_k_per_prompt, apply_ttrl_gt, filter_and_sample_by_reasoning_steps
 
                             gen_batch.meta_info["kwargs"] = {"n": self.config.ttrl.n_votes_per_prompt}
                             gen_batch_output = self.actor_rollout_wg.generate_sequences(gen_batch)
 
                             assert len(gen_batch_output) == len(batch) * self.config.ttrl.n_votes_per_prompt
 
-                            batch = apply_ttrl_gt(batch, gen_batch_output, self.config.ttrl.n_votes_per_prompt, self.tokenizer)
-                            gen_batch_output = select_top_k_per_prompt(gen_batch_output, self.config.ttrl.n_votes_per_prompt, self.config.ttrl.n_samples_per_prompt)
-
-                            assert len(gen_batch_output) == len(batch) * self.config.ttrl.n_samples_per_prompt
-                        else:
-                            if not self.async_rollout_mode:
-                                gen_batch_output = self.actor_rollout_wg.generate_sequences(gen_batch)
+                            if self.config.trainer.get("i_filter", False):
+                                # I-select: vote on ALL N_VOTES responses first (free),
+                                # then I-based selection happens after compute_log_prob
+                                batch = apply_ttrl_gt(batch, gen_batch_output, self.config.ttrl.n_votes_per_prompt, self.tokenizer)
+                                print(f"[I-select] Voted on all {self.config.ttrl.n_votes_per_prompt} responses")
+                            elif self.config.trainer.get("i_reward", False):
+                                # I-GRPO: skip majority voting, keep original GT for monitoring
+                                for i in range(len(batch)):
+                                    di = batch[i]
+                                    di.non_tensor_batch["reward_model"]["original_gt"] = di.non_tensor_batch["reward_model"]["ground_truth"]
+                                print("[I-GRPO] Skipping majority vote — using I_mean as reward")
                             else:
-                                # vllm should set async_rollout_mode to enable async rollout
-                                # sglang turns on async_rollout_mode by default
-                                gen_batch_output = self.async_rollout_manager.generate_sequences(gen_batch)
+                                batch = apply_ttrl_gt(batch, gen_batch_output, self.config.ttrl.n_votes_per_prompt, self.tokenizer)
+                            
+                            # 检查是否启用推理步骤过滤
+                            if self.config.trainer.get("filter_reasoning_steps", None) is not None:
+                                gen_batch_output = filter_and_sample_by_reasoning_steps(
+                                    data=gen_batch_output, 
+                                    n_votes_per_prompt=self.config.ttrl.n_votes_per_prompt, 
+                                    n_samples_per_prompt=self.config.ttrl.n_samples_per_prompt,
+                                    target_reasoning_steps=self.config.trainer.filter_reasoning_steps,
+                                    tokenizer=self.tokenizer,
+                                    random_seed=self.global_steps
+                                )
+                            elif self.config.trainer.get("i_filter", False):
+                                # I-select: keep ALL N_VOTES responses for entropy computation
+                                # Selection to N_SAMPLES happens after compute_log_prob
+                                print(f"[I-select] Keeping all {len(gen_batch_output)} responses "
+                                      f"(will select {self.config.ttrl.n_samples_per_prompt}/prompt after entropy)")
+                            else:
+                                gen_batch_output = select_top_k_per_prompt(gen_batch_output, self.config.ttrl.n_votes_per_prompt, self.config.ttrl.n_samples_per_prompt)
+                                assert len(gen_batch_output) == len(batch) * self.config.ttrl.n_samples_per_prompt
+                        else:
+                            # 非TTRL模式：检查是否启用独立的筛选逻辑
+                            filter_reasoning_steps = self.config.trainer.get("filter_reasoning_steps", None)
+                            if filter_reasoning_steps is not None:
+                                # 启用筛选模式：生成多个样本，筛选指定步数的，然后随机抽取
+                                from verl.trainer.ppo.ttrl_utils import filter_and_sample_by_reasoning_steps
+                                n_votes = self.config.actor_rollout_ref.rollout.n  # 使用rollout.n作为每prompt生成的样本数
+                                n_samples = self.config.trainer.get("n_samples_per_prompt", 32)  # 默认32
+                                
+                                gen_batch.meta_info["kwargs"] = {"n": n_votes}
+                                if not self.async_rollout_mode:
+                                    gen_batch_output = self.actor_rollout_wg.generate_sequences(gen_batch)
+                                else:
+                                    gen_batch_output = self.async_rollout_manager.generate_sequences(gen_batch)
+                                
+                                # 筛选和采样
+                                gen_batch_output = filter_and_sample_by_reasoning_steps(
+                                    data=gen_batch_output,
+                                    n_votes_per_prompt=n_votes,
+                                    n_samples_per_prompt=n_samples,
+                                    target_reasoning_steps=filter_reasoning_steps,
+                                    tokenizer=self.tokenizer,
+                                    random_seed=self.global_steps
+                                )
+                            else:
+                                # 普通模式：直接生成
+                                if not self.async_rollout_mode:
+                                    gen_batch_output = self.actor_rollout_wg.generate_sequences(gen_batch)
+                                else:
+                                    # vllm should set async_rollout_mode to enable async rollout
+                                    # sglang turns on async_rollout_mode by default
+                                    gen_batch_output = self.async_rollout_manager.generate_sequences(gen_batch)
                         timing_raw.update(gen_batch_output.meta_info["timing"])
                         gen_batch_output.meta_info.pop("timing", None)
 
@@ -1172,17 +1233,72 @@ class RayPPOTrainer:
 
                             del gen_baseline_batch, gen_baseline_output
 
+                    # 初始化actual_num_repeat变量（用于后续的advantage计算和metrics）
+                    actual_num_repeat = self.config.actor_rollout_ref.rollout.n
+                    
                     if not repeat_sampling_sglang_grpo:
                         batch.non_tensor_batch["uid"] = np.array(
                             [str(uuid.uuid4()) for _ in range(len(batch.batch))], dtype=object
                         )
                         # repeat to align with repeated responses in rollout
-                        batch = batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
+                        # 根据实际生成的样本数计算repeat次数
+                        if self.config.get("ttrl", {}).get("enable", False) or self.config.trainer.get("filter_reasoning_steps", None) is not None:
+                            # TTRL模式 或 筛选模式：计算实际的repeat次数
+                            actual_num_repeat = len(gen_batch_output) // len(batch.batch)
+                            print(f"[Filter] Batch repeat times: {actual_num_repeat} (actual samples: {len(gen_batch_output)}, prompts: {len(batch.batch)})")
+                            batch = batch.repeat(repeat_times=actual_num_repeat, interleave=True)
+                        else:
+                            batch = batch.repeat(repeat_times=actual_num_repeat, interleave=True)
 
                     batch = batch.union(gen_batch_output)
 
+                    # ★ 关键修复: batch.repeat() 使用 np.repeat 导致 non_tensor_batch 中
+                    # object 类型的 numpy 数组元素(dict)变成共享引用。
+                    # 同一 prompt 的 32 个样本共享同一个 extra_info dict，后续写入
+                    # step_transitions/token_entropies 等会互相覆盖 → 同组所有样本
+                    # 得到相同奖励 → GRPO advantage=0 → 无训练信号。
+                    # 必须为每个样本创建独立的 dict 副本。
+                    for _key in ("extra_info", "reward_model"):
+                        if _key in batch.non_tensor_batch:
+                            old_arr = batch.non_tensor_batch[_key]
+                            new_arr = np.empty(len(old_arr), dtype=object)
+                            for _i in range(len(old_arr)):
+                                v = old_arr[_i]
+                                new_arr[_i] = dict(v) if isinstance(v, dict) else v
+                            batch.non_tensor_batch[_key] = new_arr
+
                     if "response_mask" not in batch.batch:
                         batch.batch["response_mask"] = compute_response_mask(batch)
+
+                    # ===== 截断统计（仅记录，不遮罩）=====
+                    # 截断响应保留在训练中，由 GRPO 自然赋予负 advantage
+                    if hasattr(self, 'tokenizer') and self.tokenizer.eos_token_id is not None:
+                        responses = batch.batch["responses"]
+                        eos_token_id = self.tokenizer.eos_token_id
+                        if isinstance(eos_token_id, (list, tuple)):
+                            eos_ids_tensor = torch.tensor(eos_token_id, device=responses.device)
+                            is_eos = torch.isin(responses, eos_ids_tensor)
+                        else:
+                            is_eos = (responses == eos_token_id)
+                        has_eos = is_eos.any(dim=1)
+                        n_truncated = int((~has_eos).sum().item())
+                        n_total = has_eos.numel()
+
+                        if n_truncated > 0:
+                            print(f"[TruncInfo] {n_truncated}/{n_total} truncated responses "
+                                  f"({100.0 * n_truncated / n_total:.1f}%) — kept for training")
+
+                        rmask = batch.batch["response_mask"]
+                        resp_lengths = rmask.sum(dim=-1).float()
+                        valid_lengths = resp_lengths[resp_lengths > 0]
+                        metrics.update({
+                            "training/truncated_ratio": n_truncated / max(n_total, 1),
+                            "training/mean_response_length": resp_lengths.mean().item(),
+                            "training/mean_valid_response_length": (
+                                valid_lengths.mean().item() if len(valid_lengths) > 0 else 0.0
+                            ),
+                        })
+
                     # Balance the number of valid tokens across DP ranks.
                     # NOTE: This usually changes the order of data in the `batch`,
                     # which won't affect the advantage calculation (since it's based on uid),
@@ -1194,6 +1310,210 @@ class RayPPOTrainer:
                     # compute global_valid tokens
                     batch.meta_info["global_token_num"] = torch.sum(batch.batch["attention_mask"], dim=-1).tolist()
 
+                    # recompute old_log_probs and policy entropy
+                    # NOTE: Must compute BEFORE reward to provide token_entropies for entropy-based rewards
+                    
+                    # R_brake token reward 不需要 step boundaries (已精简)
+                    
+                    with marked_timer("old_log_prob", timing_raw, color="blue"):
+                        old_log_prob = self.actor_rollout_wg.compute_log_prob(batch)
+                        entropys = old_log_prob.batch["entropys"]
+                        response_masks = batch.batch["response_mask"]
+                        loss_agg_mode = self.config.actor_rollout_ref.actor.loss_agg_mode
+                        
+                        # actor/entropy 由 compute_data_metrics → compute_policy_entropy_metrics 统一计算
+                        # 与 policy_entropy/token/mean 使用相同数据和公式，保证两者在监控中完全一致
+                        
+                        # Store token-level entropies in extra_info for entropy-based reward functions
+                        compute_entropy_flag = False
+                        try:
+                            compute_entropy_flag = OmegaConf.select(self.config, "trainer.compute_entropy_for_reward", default=False)
+                            if isinstance(compute_entropy_flag, str):
+                                compute_entropy_flag = compute_entropy_flag.lower() in ('true', '1', 'yes')
+                        except Exception:
+                            pass
+                        
+                        if compute_entropy_flag:
+                            try:
+                                batch_size = len(batch)
+                                
+                                # 初始化或验证 extra_info 数组
+                                if "extra_info" not in batch.non_tensor_batch:
+                                    batch.non_tensor_batch["extra_info"] = np.array(
+                                        [{} for _ in range(batch_size)], dtype=object
+                                    )
+                                elif not isinstance(batch.non_tensor_batch["extra_info"], np.ndarray) or \
+                                     len(batch.non_tensor_batch["extra_info"]) != batch_size:
+                                    batch.non_tensor_batch["extra_info"] = np.array(
+                                        [{} for _ in range(batch_size)], dtype=object
+                                    )
+                                
+                                # 为每个样本设置 token_ids 和 token_entropies
+                                for i in range(batch_size):
+                                    # 使用 response_mask 获取有效的 response 长度
+                                    response_mask = batch.batch["response_mask"][i]
+                                    valid_response_length = int(response_mask.sum().item())
+                                    
+                                    # 获取有效的 response token ids
+                                    response_ids = batch.batch["responses"][i]
+                                    valid_response_ids = response_ids[:valid_response_length]
+                                    
+                                    # 获取有效的 token entropies
+                                    sample_entropies = entropys[i, :valid_response_length].detach().cpu().numpy()
+                                    
+                                    # 确保 extra_info[i] 是字典
+                                    if not isinstance(batch.non_tensor_batch["extra_info"][i], dict):
+                                        batch.non_tensor_batch["extra_info"][i] = {}
+                                    
+                                    # 设置 token_ids 和 token_entropies
+                                    batch.non_tensor_batch["extra_info"][i]["token_ids"] = valid_response_ids.tolist()
+                                    batch.non_tensor_batch["extra_info"][i]["token_entropies"] = sample_entropies
+                                
+                                # Compute h_bar_boxed for entropy coherence loss
+                                _use_coherence = self.config.actor_rollout_ref.actor.get(
+                                    "use_entropy_coherence", False)
+                                if _use_coherence:
+                                    import re as _re
+                                    h_bar_boxed = torch.zeros(batch_size, device=entropys.device)
+                                    for i in range(batch_size):
+                                        rmask = batch.batch["response_mask"][i]
+                                        vlen = int(rmask.sum().item())
+                                        if vlen < 2:
+                                            h_bar_boxed[i] = entropys[i, :max(vlen, 1)].mean()
+                                            continue
+                                        rids = batch.batch["responses"][i][:vlen].tolist()
+                                        text, spans = "", []
+                                        for ti, tid in enumerate(rids):
+                                            s = len(text)
+                                            text += self.tokenizer.decode([tid], skip_special_tokens=True)
+                                            spans.append((s, len(text)))
+                                        bset = set()
+                                        for m in _re.finditer(r'\\boxed\{', text):
+                                            depth, p = 1, m.end()
+                                            while p < len(text) and depth > 0:
+                                                if text[p] == '{': depth += 1
+                                                elif text[p] == '}': depth -= 1
+                                                p += 1
+                                            for ti, (ts, te) in enumerate(spans):
+                                                if ts < p and te > m.start():
+                                                    bset.add(ti)
+                                        if len(bset) >= 1:
+                                            bidx = list(bset)
+                                            h_bar_boxed[i] = entropys[i, bidx].mean()
+                                        else:
+                                            h_bar_boxed[i] = entropys[i, :vlen].mean()
+                                    batch.batch["h_bar_boxed"] = h_bar_boxed
+                                    print(f"[Coherence] h_bar_boxed: mean={h_bar_boxed.mean():.4f}, "
+                                          f"std={h_bar_boxed.std():.4f}")
+
+                            except Exception as e:
+                                import traceback
+                                print(f"[EntropyReward] ERROR: {e}")
+                                traceback.print_exc()
+                        
+                        # 将 token_reward (R_brake) 存入 extra_info
+                        batch_size_st = len(batch)
+                        if hasattr(old_log_prob, 'non_tensor_batch') and \
+                           "step_transitions" in old_log_prob.non_tensor_batch:
+                            st_list = old_log_prob.non_tensor_batch["step_transitions"]
+                            for i in range(min(batch_size_st, len(st_list))):
+                                if isinstance(batch.non_tensor_batch["extra_info"][i], dict):
+                                    tok_r = None
+                                    if st_list[i] is not None and isinstance(st_list[i], dict):
+                                        tok_r = st_list[i].get("token_reward", None)
+                                    if tok_r is not None:
+                                        batch.non_tensor_batch["extra_info"][i]["token_reward"] = tok_r
+                            del old_log_prob.non_tensor_batch["step_transitions"]
+                        
+                        # Keep entropys in batch for detailed policy entropy metrics computation
+                        # This will be used by compute_policy_entropy_metrics() in compute_data_metrics()
+                        # Do NOT pop entropys here - let it flow through to metrics computation
+                        batch = batch.union(old_log_prob)
+
+                    # I-select: now that entropys are available, select best N_SAMPLES by I_mean
+                    if self.config.get("ttrl", {}).get("enable", False) and self.config.trainer.get("i_filter", False):
+                        from verl.trainer.ppo.ttrl_utils import i_select_by_inertia
+                        n_keep = self.config.ttrl.n_samples_per_prompt
+                        batch = i_select_by_inertia(batch, n_keep)
+                        actual_num_repeat = n_keep
+                        entropys = batch.batch["entropys"]
+
+                    # entropys flow through to dp_actor for entropy gradient blocking
+
+                    # Compute reference model log_prob (needed for KL loss in actor update)
+                    if self.use_reference_policy:
+                        with marked_timer("ref", timing_raw, color="olive"):
+                            if not self.ref_in_actor:
+                                ref_log_prob = self.ref_policy_wg.compute_ref_log_prob(batch)
+                            else:
+                                ref_log_prob = self.actor_rollout_wg.compute_ref_log_prob(batch)
+                            batch = batch.union(ref_log_prob)
+
+                    # ===== CDQ 奖励: R = mean(log P(y_t) + H(t)) =====
+                    # CDQ = Confident Decision Quality (不确定中的确定选择)
+                    #
+                    # log P(y_t): 对选中 token 的信心 (≤0, 越高越好)
+                    # H(t):      分布的不确定性 (≥0, 适度即好)
+                    # CDQ(t) = log P(y_t) + H(t):
+                    #   > 0 → 考虑多选项但有明确首选 → 适应了答案分布 ✓
+                    #   < 0 → 不确定且选择不清晰 → 噪声 ✗
+                    #   ≈ 0 → 过度锐化 或 完全随机 ✗
+                    #
+                    # 三部分框架:
+                    #   ① 探索时 CDQ>0 → 有方向的探索, 不乱增熵
+                    #   ② 压缩时 CDQ>0 → 基于证据的压缩, 不丢信息
+                    #   ③ 全程 CDQ>0 → 每步好决策 → 信息自然守恒
+                    if "entropys" in batch.batch.keys() and "old_log_probs" in batch.batch.keys():
+                        try:
+                            cur_ent = batch.batch["entropys"].float()   # (B, seq_len)
+                            log_p = batch.batch["old_log_probs"].float()  # (B, seq_len)
+                            rmask = batch.batch["response_mask"].float()  # (B, seq_len)
+                            lengths = rmask.sum(dim=1).clamp(min=1)  # (B,)
+                            batch_size_ent = cur_ent.size(0)
+
+                            # CDQ per token: 在不确定中做出确定选择
+                            cdq = log_p + cur_ent  # (B, seq_len)
+
+                            # 奖励 = mean CDQ
+                            r_total = (cdq * rmask).sum(dim=1) / lengths  # (B,)
+
+                            # ---- 监控指标 (不参与奖励) ----
+                            # mean log P: 序列对数概率 (越高=越可预测)
+                            mean_logp = (log_p * rmask).sum(dim=1) / lengths
+                            # mean H: 平均熵 (越高=越不确定)
+                            mean_h = (cur_ent * rmask).sum(dim=1) / lengths
+                            # S3: 路径效率 (方向性)
+                            v_theta = cur_ent[:, 1:] - cur_ent[:, :-1]
+                            abs_v = torch.abs(v_theta)
+                            v_mask = rmask[:, 1:]
+                            total_path = (abs_v * v_mask).sum(dim=1).clamp(min=1e-8)
+                            cumsum_mask = rmask.cumsum(dim=1)
+                            first_mask = (cumsum_mask == 1).float() * rmask
+                            rev_cumsum = rmask.flip(dims=[1]).cumsum(dim=1).flip(dims=[1])
+                            last_mask = (rev_cumsum == 1).float() * rmask
+                            h_first = (cur_ent * first_mask).sum(dim=1)
+                            h_last = (cur_ent * last_mask).sum(dim=1)
+                            r_s3 = (h_first - h_last) / total_path
+
+                            # 批量转 CPU
+                            r_total_cpu = r_total.detach().cpu().tolist()
+                            mean_logp_cpu = mean_logp.detach().cpu().tolist()
+                            mean_h_cpu = mean_h.detach().cpu().tolist()
+                            r_s3_cpu = r_s3.detach().cpu().tolist()
+
+                            for i in range(batch_size_ent):
+                                if isinstance(batch.non_tensor_batch["extra_info"][i], dict):
+                                    ei = batch.non_tensor_batch["extra_info"][i]
+                                    ei["entropy_efficiency"] = r_total_cpu[i]
+                                    ei["mean_logp"] = mean_logp_cpu[i]
+                                    ei["mean_h"] = mean_h_cpu[i]
+                                    ei["s3"] = r_s3_cpu[i]
+
+                        except Exception as e:
+                            import traceback
+                            print(f"[CDQ Reward] ERROR: {e}")
+                            traceback.print_exc()
+
                     with marked_timer("reward", timing_raw, color="yellow"):
                         # compute reward model score
                         if self.use_rm:
@@ -1204,18 +1524,6 @@ class RayPPOTrainer:
                             future_reward = compute_reward_async.remote(batch, self.config, self.tokenizer)
                         else:
                             reward_tensor, reward_extra_infos_dict = compute_reward(batch, self.reward_fn)
-
-                    # recompute old_log_probs
-                    with marked_timer("old_log_prob", timing_raw, color="blue"):
-                        old_log_prob = self.actor_rollout_wg.compute_log_prob(batch)
-                        entropys = old_log_prob.batch["entropys"]
-                        response_masks = batch.batch["response_mask"]
-                        loss_agg_mode = self.config.actor_rollout_ref.actor.loss_agg_mode
-                        entropy_agg = agg_loss(loss_mat=entropys, loss_mask=response_masks, loss_agg_mode=loss_agg_mode)
-                        old_log_prob_metrics = {"actor/entropy": entropy_agg.detach().item()}
-                        metrics.update(old_log_prob_metrics)
-                        old_log_prob.batch.pop("entropys")
-                        batch = batch.union(old_log_prob)
 
                         if "rollout_log_probs" in batch.batch.keys():
                             # TODO: we may want to add diff of probs too.
@@ -1241,14 +1549,8 @@ class RayPPOTrainer:
                                 }
                             )
 
-                    if self.use_reference_policy:
-                        # compute reference log_prob
-                        with marked_timer("ref", timing_raw, color="olive"):
-                            if not self.ref_in_actor:
-                                ref_log_prob = self.ref_policy_wg.compute_ref_log_prob(batch)
-                            else:
-                                ref_log_prob = self.actor_rollout_wg.compute_ref_log_prob(batch)
-                            batch = batch.union(ref_log_prob)
+                    # Note: ref_log_prob computation has been moved earlier (before reward)
+                    # to enable ref_entropy_efficiency reward computation
 
                     # compute values
                     if self.use_critic:
@@ -1277,22 +1579,305 @@ class RayPPOTrainer:
 
                         # compute advantages, executed on the driver process
 
-                        norm_adv_by_std_in_grpo = self.config.algorithm.get(
-                            "norm_adv_by_std_in_grpo", True
-                        )  # GRPO adv normalization factor
+                        norm_adv_by_std_in_grpo = True
+
+                        # 使用之前计算的actual_num_repeat（在TTRL strict模式下可能与配置值不同）
+                        print(f"[Advantage] Using num_repeat: {actual_num_repeat}")
 
                         batch = compute_advantage(
                             batch,
                             adv_estimator=self.config.algorithm.adv_estimator,
                             gamma=self.config.algorithm.gamma,
                             lam=self.config.algorithm.lam,
-                            num_repeat=self.config.actor_rollout_ref.rollout.n,
+                            num_repeat=actual_num_repeat,
                             norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
                             multi_turn=self.config.actor_rollout_ref.rollout.multi_turn.enable,
                             config=self.config.algorithm,
                         )
 
-                    # update critic
+                        _use_uniform_adv = self.config.actor_rollout_ref.actor.get(
+                            "use_uniform_advantage", False)
+                        if _use_uniform_adv:
+                            with torch.no_grad():
+                                raw_scores = (batch.batch["token_level_scores"] * batch.batch["response_mask"]).sum(dim=-1)
+                                uniform_adv = torch.where(
+                                    raw_scores > 0.5,
+                                    torch.ones_like(raw_scores),
+                                    -torch.ones_like(raw_scores),
+                                )
+                                batch.batch["advantages"] = uniform_adv.unsqueeze(-1) * batch.batch["response_mask"]
+                                n_pos = (raw_scores > 0.5).sum().item()
+                                n_neg = (raw_scores <= 0.5).sum().item()
+                                print(f"[UniformAdv] Override to ±1: {n_pos} positive, {n_neg} negative")
+
+                        # Token-level W1 additive advantage: w(t) = mean_W1_prompt - mean_j|H_t - H_boxed_j|
+                        _use_step_adv = self.config.actor_rollout_ref.actor.get(
+                            "use_step_advantage", False)
+                        if _use_step_adv and "entropys" in batch.batch.keys():
+                            try:
+                                import re as _re
+                                from collections import defaultdict as _ddict
+                                _step_alpha = self.config.actor_rollout_ref.actor.get(
+                                    "step_advantage_alpha", 0.1)
+
+                                def _find_boxed_ent(ent_1d, rids, tokenizer):
+                                    text = tokenizer.decode(rids, skip_special_tokens=True)
+                                    m = list(_re.finditer(r'\\boxed\s*\{', text))
+                                    if not m:
+                                        return None
+                                    start_char = m[-1].start()
+                                    depth, end_char = 0, len(text)
+                                    for ci in range(m[-1].end() - 1, len(text)):
+                                        if text[ci] == '{':
+                                            depth += 1
+                                        elif text[ci] == '}':
+                                            depth -= 1
+                                            if depth == 0:
+                                                end_char = ci + 1
+                                                break
+                                    cum_len, st, en = 0, 0, len(rids)
+                                    for ti, tid in enumerate(rids):
+                                        tok_str = tokenizer.decode([tid], skip_special_tokens=True)
+                                        prev = cum_len
+                                        cum_len += len(tok_str)
+                                        if prev <= start_char < cum_len:
+                                            st = ti
+                                        if prev < end_char <= cum_len:
+                                            en = ti + 1
+                                            break
+                                    return ent_1d[st:en] if en > st else None
+
+                                with torch.no_grad():
+                                    B = len(batch)
+                                    ent_all = batch.batch["entropys"]
+                                    resp_all = batch.batch["responses"]
+                                    rmask_all = batch.batch["response_mask"]
+                                    uids = batch.non_tensor_batch["uid"]
+
+                                    w1_per_token = torch.zeros_like(ent_all)
+
+                                    for i in range(B):
+                                        vlen = int(rmask_all[i].sum().item())
+                                        if vlen < 5:
+                                            continue
+                                        ent = ent_all[i, :vlen]
+                                        rids = resp_all[i, :vlen].tolist()
+
+                                        boxed_ent = _find_boxed_ent(ent, rids, self.tokenizer)
+                                        if boxed_ent is None or len(boxed_ent) < 2:
+                                            continue
+
+                                        # W1_token(t) = mean_j |H_t - H_boxed_j|
+                                        w1_per_token[i, :vlen] = torch.mean(
+                                            torch.abs(ent.unsqueeze(-1) - boxed_ent.unsqueeze(0)),
+                                            dim=-1)
+
+                                    uid_to_idx = _ddict(list)
+                                    for i in range(B):
+                                        uid_to_idx[uids[i]].append(i)
+
+                                    token_adv = torch.zeros_like(ent_all)
+                                    last_mean_w1 = 0.0
+                                    for uid, indices in uid_to_idx.items():
+                                        vals = []
+                                        for idx in indices:
+                                            active = w1_per_token[idx][rmask_all[idx] > 0]
+                                            if len(active) > 0:
+                                                vals.append(active)
+                                        all_v = torch.cat(vals) if vals else torch.tensor([0.0])
+                                        mean_w1 = all_v.mean().item() if len(all_v) > 0 else 0.0
+                                        last_mean_w1 = mean_w1
+                                        for idx in indices:
+                                            token_adv[idx] = (mean_w1 - w1_per_token[idx]) * rmask_all[idx]
+
+                                    batch.batch["advantages"] = (
+                                        batch.batch["advantages"] + _step_alpha * token_adv)
+
+                                    ta_active = token_adv[rmask_all > 0]
+                                    metrics.update({
+                                        "token_adv/mean": ta_active.mean().item(),
+                                        "token_adv/std": ta_active.std().item(),
+                                        "token_adv/alpha": _step_alpha,
+                                        "token_adv/mean_w1": last_mean_w1,
+                                    })
+                                    print(f"[TokenW1Adv] mean={ta_active.mean():.4f} "
+                                          f"std={ta_active.std():.4f} alpha={_step_alpha}")
+                            except Exception as e:
+                                import traceback
+                                print(f"[TokenW1Adv] ERROR: {e}")
+                                traceback.print_exc()
+
+                        # Token-level n-gram overlap advantage shaping (group-centered)
+                        # Pos: adj[t] = alpha * (overlap_t - group_mean)  高重叠增大优势
+                        # Neg: adj[t] = alpha * (overlap_t - group_mean)  高重叠减惩罚
+                        # 0-var groups: skipped
+                        _use_bleu_overlap = self.config.actor_rollout_ref.actor.get(
+                            "use_bleu_overlap_advantage", False)
+                        if _use_bleu_overlap:
+                            try:
+                                import numpy as _np
+                                from collections import defaultdict as _ddict
+
+                                _bleu_alpha = self.config.actor_rollout_ref.actor.get(
+                                    "bleu_overlap_alpha", 0.5)
+                                _bleu_max_n = self.config.actor_rollout_ref.actor.get(
+                                    "bleu_overlap_max_n", 4)
+
+                                def _token_ngram_overlap(token_ids, other_ids_list, max_n):
+                                    T = len(token_ids)
+                                    if T == 0 or not other_ids_list:
+                                        return _np.zeros(T)
+                                    ngram_sets = []
+                                    for n in range(1, max_n + 1):
+                                        combined = set()
+                                        for o_ids in other_ids_list:
+                                            for k in range(len(o_ids) - n + 1):
+                                                combined.add(tuple(o_ids[k:k + n]))
+                                        ngram_sets.append(combined)
+                                    scores = _np.zeros(T)
+                                    for t in range(T):
+                                        total, matched = 0, 0
+                                        for ni, n in enumerate(range(1, max_n + 1)):
+                                            lo = max(0, t - n + 1)
+                                            hi = min(t + 1, T - n + 1)
+                                            for s in range(lo, hi):
+                                                total += 1
+                                                if tuple(token_ids[s:s + n]) in ngram_sets[ni]:
+                                                    matched += 1
+                                        scores[t] = matched / total if total > 0 else 0.0
+                                    return scores
+
+                                with torch.no_grad():
+                                    B = len(batch)
+                                    resp_all = batch.batch["responses"]
+                                    rmask_all = batch.batch["response_mask"]
+                                    scores_all = batch.batch["token_level_scores"].sum(dim=-1)
+                                    uids = batch.non_tensor_batch["uid"]
+
+                                    uid_to_idx = _ddict(list)
+                                    for i in range(B):
+                                        uid_to_idx[uids[i]].append(i)
+
+                                    bleu_adv = torch.zeros_like(batch.batch["advantages"])
+                                    n_cross, n_zv = 0, 0
+                                    all_resp_adj = []
+
+                                    for uid, g_indices in uid_to_idx.items():
+                                        g_tids, g_correct, g_vlens = [], [], []
+                                        for idx in g_indices:
+                                            vl = int(rmask_all[idx].sum().item())
+                                            g_tids.append(resp_all[idx, :vl].tolist())
+                                            g_correct.append(scores_all[idx].item() > 0)
+                                            g_vlens.append(vl)
+
+                                        pos_loc = [j for j, c in enumerate(g_correct) if c]
+                                        neg_loc = [j for j, c in enumerate(g_correct) if not c]
+
+                                        if pos_loc and neg_loc:
+                                            n_cross += 1
+                                            pos_tids = [g_tids[j] for j in pos_loc]
+                                            neg_tids = [g_tids[j] for j in neg_loc]
+
+                                            all_ovs = []
+                                            ov_per_resp = {}
+                                            for li in range(len(g_indices)):
+                                                vl = g_vlens[li]
+                                                if vl < 3:
+                                                    continue
+                                                other = neg_tids if g_correct[li] else pos_tids
+                                                ov = _token_ngram_overlap(
+                                                    g_tids[li], other, _bleu_max_n)
+                                                ov_per_resp[li] = ov
+                                                all_ovs.append(ov)
+
+                                            if all_ovs:
+                                                gmean = float(_np.concatenate(all_ovs).mean())
+                                            else:
+                                                gmean = 0.0
+
+                                            for li, gi in enumerate(g_indices):
+                                                if li not in ov_per_resp:
+                                                    continue
+                                                ov = ov_per_resp[li]
+                                                vl = g_vlens[li]
+                                                if g_correct[li]:
+                                                    adj = _bleu_alpha * (ov - gmean)
+                                                else:
+                                                    adj = _bleu_alpha * (ov - gmean)
+                                                all_resp_adj.append(float(adj.sum() / vl))
+                                                bleu_adv[gi, :vl] = torch.tensor(
+                                                    adj, dtype=bleu_adv.dtype,
+                                                    device=bleu_adv.device)
+                                        else:
+                                            n_zv += 1
+
+                                    batch.batch["advantages"] = batch.batch["advantages"] + bleu_adv
+                                    ba_active = bleu_adv[rmask_all > 0]
+                                    ra_std = float(_np.std(all_resp_adj)) if all_resp_adj else 0.0
+                                    metrics.update({
+                                        "token_gc_overlap/mean": ba_active.mean().item(),
+                                        "token_gc_overlap/std": ba_active.std().item(),
+                                        "token_gc_overlap/alpha": _bleu_alpha,
+                                        "token_gc_overlap/n_cross": n_cross,
+                                        "token_gc_overlap/n_zero_var": n_zv,
+                                        "token_gc_overlap/resp_adj_std": ra_std,
+                                    })
+                                    print(f"[TokenGC] mean={ba_active.mean():.6f} "
+                                          f"std={ba_active.std():.4f} a={_bleu_alpha} "
+                                          f"cross={n_cross} zv={n_zv} "
+                                          f"resp_adj_std={ra_std:.6f}")
+                            except Exception as e:
+                                import traceback
+                                print(f"[TokenGC] ERROR: {e}")
+                                traceback.print_exc()
+
+                        # Two-pass adversarial training with entropy-weighted advantages
+                        # w = H (per-token entropy), w_norm = H / H̄ (mean=1 per response)
+                        # Phase 1 (push): A₁ = -push * A * w_norm → explore away
+                        # Phase 2 (pull): A₂ = +pull * A * w_norm → exploit back
+                        # NOTE: kl_direction_flip / SAM in dp_actor replaces the two-pass mechanism
+                        _kl_flip = self.config.actor_rollout_ref.actor.get("kl_direction_flip", False)
+                        _use_sam = self.config.actor_rollout_ref.actor.get("use_sam", False)
+                        _use_push_pull = self.config.actor_rollout_ref.actor.get("use_push_pull", False)
+                        si_two_pass = (self.config.trainer.get("si_plasticity", False)
+                                       and "entropys" in batch.batch.keys()
+                                       and not _kl_flip
+                                       and not _use_sam
+                                       and not _use_push_pull)
+
+                        if si_two_pass:
+                            with torch.no_grad():
+                                rmask_f = batch.batch["response_mask"].float()
+                                advantages_std = batch.batch["advantages"].clone()
+                                push = self.config.trainer.get("si_push", 0.5)
+                                pull = self.config.trainer.get("si_pull", 1.5)
+
+                                H = batch.batch["entropys"].float()
+                                w = (H / (H + 1.0)) * rmask_f
+
+                                n_repeat = actual_num_repeat
+                                B, S = w.shape
+                                n_prompts = B // n_repeat
+                                w_3d = w.view(n_prompts, n_repeat, S)
+                                rmask_3d = rmask_f.view(n_prompts, n_repeat, S)
+                                w_bar_3d = (w_3d.sum(dim=(1, 2), keepdim=True) /
+                                            rmask_3d.sum(dim=(1, 2), keepdim=True).clamp(min=1))
+                                w_norm = ((w_3d / (w_bar_3d + 1e-8)) * rmask_3d).view(B, S)
+
+                                w_active = w_norm[rmask_f > 0]
+                                metrics.update({
+                                    "si_plasticity/H_mean":      H[rmask_f > 0].mean().item(),
+                                    "si_plasticity/H_std":       H[rmask_f > 0].std().item(),
+                                    "si_plasticity/w_norm_mean": w_active.mean().item(),
+                                    "si_plasticity/w_norm_std":  w_active.std().item(),
+                                    "si_plasticity/w_norm_max":  w_active.max().item(),
+                                    "si_plasticity/push":        push,
+                                    "si_plasticity/pull":        pull,
+                                })
+                                print(f"[SI] H={H[rmask_f > 0].mean():.3f}±{H[rmask_f > 0].std():.3f}, "
+                                      f"w_norm={w_active.mean():.2f}±{w_active.std():.2f}, "
+                                      f"push={push}, pull={pull}")
+
                     if self.use_critic:
                         with marked_timer("update_critic", timing_raw, color="pink"):
                             critic_output = self.critic_wg.update_critic(batch)
@@ -1301,20 +1886,77 @@ class RayPPOTrainer:
 
                     # implement critic warmup
                     if self.config.trainer.critic_warmup <= self.global_steps:
-                        # update actor
-                        with marked_timer("update_actor", timing_raw, color="red"):
-                            batch.meta_info["multi_turn"] = self.config.actor_rollout_ref.rollout.multi_turn.enable
-                            actor_output = self.actor_rollout_wg.update_actor(batch)
-                        actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])
-                        metrics.update(actor_output_metrics)
+                        batch.meta_info["multi_turn"] = self.config.actor_rollout_ref.rollout.multi_turn.enable
+
+                        if si_two_pass:
+                            # Phase 1 (Push): explore away from current policy
+                            with marked_timer("update_actor_push", timing_raw, color="orange"):
+                                batch.batch["advantages"] = (-push * advantages_std * w_norm).to(advantages_std.device)
+                                batch.meta_info["step_lr"] = False
+                                actor_output_push = self.actor_rollout_wg.update_actor(batch)
+                            push_metrics = reduce_metrics(actor_output_push.meta_info["metrics"])
+                            metrics.update({f"actor_push/{k.split('/')[-1]}": v
+                                            for k, v in push_metrics.items() if "pg_loss" in k or "kl" in k or "clipfrac" in k})
+
+                            # Phase 2 (Pull): exploit back toward correct direction
+                            with marked_timer("update_actor_pull", timing_raw, color="red"):
+                                batch.batch["advantages"] = (pull * advantages_std * w_norm).to(advantages_std.device)
+                                batch.meta_info["step_lr"] = True
+                                actor_output = self.actor_rollout_wg.update_actor(batch)
+                            actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])
+                            metrics.update(actor_output_metrics)
+                        elif _use_push_pull:
+                            _pp_alpha = self.config.actor_rollout_ref.actor.get("push_pull_alpha", 0.3)
+                            with torch.no_grad():
+                                rmask_f = batch.batch["response_mask"].float()
+                                A_orig = batch.batch["advantages"].clone()
+
+                                if "entropys" in batch.batch.keys():
+                                    H = batch.batch["entropys"].float()
+                                else:
+                                    H = torch.ones_like(rmask_f)
+
+                                H_sum = (H * rmask_f).sum(-1, keepdim=True)
+                                H_count = rmask_f.sum(-1, keepdim=True).clamp(min=1)
+                                H_mean = H_sum / H_count
+                                w = (H / H_mean.clamp(min=1e-6)).clamp(0.2, 5.0) * rmask_f
+                                w_mean = (w * rmask_f).sum(-1, keepdim=True) / H_count
+                                w = w / w_mean.clamp(min=1e-6)
+
+                                A_push = (-_pp_alpha * w * A_orig).to(A_orig.dtype)
+                                A_pull = ((1.0 + _pp_alpha) * w * A_orig).to(A_orig.dtype)
+
+                            pp_batch = batch.repeat(repeat_times=2, interleave=True)
+                            pp_batch.batch["advantages"][0::2] = A_push
+                            pp_batch.batch["advantages"][1::2] = A_pull
+
+                            w_active = w[rmask_f > 0]
+                            metrics.update({
+                                "push_pull/w_mean": w_active.mean().item(),
+                                "push_pull/w_std": w_active.std().item(),
+                                "push_pull/H_mean": H_mean.mean().item(),
+                                "push_pull/alpha": _pp_alpha,
+                            })
+
+                            with marked_timer("update_actor", timing_raw, color="red"):
+                                actor_output = self.actor_rollout_wg.update_actor(pp_batch)
+                            actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])
+                            metrics.update(actor_output_metrics)
+                        else:
+                            # Standard single-pass actor update
+                            with marked_timer("update_actor", timing_raw, color="red"):
+                                actor_output = self.actor_rollout_wg.update_actor(batch)
+                            actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])
+                            metrics.update(actor_output_metrics)
 
                     if self.config.get("ttrl", {}).get("enable", False):
                         from verl.trainer.ppo.ttrl_utils import apply_original_gt, compute_ttrl_metrics
                         batch = apply_original_gt(batch)
                         reward_tensor_original, reward_extra_infos_dict_original = compute_reward(batch, self.reward_fn)
                         batch.batch["token_level_scores_original"] = reward_tensor_original
-                        # Compute ttrl metrics
-                        ttrl_metrics = compute_ttrl_metrics(batch, self.config.ttrl.n_samples_per_prompt)
+                        # Compute ttrl metrics (使用实际的repeat次数)
+                        # 在strict模式下，actual_num_repeat可能与n_samples_per_prompt不同
+                        ttrl_metrics = compute_ttrl_metrics(batch, actual_num_repeat)
                         for key, value in ttrl_metrics.items():
                                 metrics.update({f"train/{key}": value})
 
@@ -1375,6 +2017,49 @@ class RayPPOTrainer:
                 # TODO: implement actual tflpo and theoretical tflpo
                 n_gpus = self.resource_pool_manager.get_n_gpus()
                 metrics.update(compute_throughout_metrics(batch=batch, timing_raw=timing_raw, n_gpus=n_gpus))
+                
+                # Collect reward extra info metrics
+                reward_extra_metrics = {}
+                reward_metric_keys = [
+                    "entropy_reward",
+                    "mean_entropy",
+                    "high_entropy_avg",
+                    "low_entropy_avg",
+                    "high_diff_entropy_avg",
+                    "low_diff_entropy_avg",
+                    "high_relative_diff",
+                    "low_relative_diff",
+                    "n_high_steps",
+                    "n_low_steps",
+                    "n_steps",
+                    "acc",
+                    "correctness_score",
+                    # 正确性奖励 + Phi(z) 熵门控 per-token 加权 metrics
+                    "gate_mean",         # mean(Phi) 门控通过率 (监控)
+                    "H_bar",             # 自适应熵阈值 (监控)
+                    "mean_H",            # 平均熵 (检测坍缩)
+                ]
+                # Log eta reward metrics for monitoring
+                try:
+                    ei_arr = batch.non_tensor_batch.get("extra_info", None)
+                    if ei_arr is not None and len(ei_arr) > 0 and isinstance(ei_arr[0], dict):
+                        for eta_key in ["eta_up", "eta_down", "w_linear", "prompt_accuracy", "entropy_eta_reward"]:
+                            if eta_key in ei_arr[0]:
+                                vals = [ei.get(eta_key, 0.0) for ei in ei_arr if isinstance(ei, dict) and eta_key in ei]
+                                if vals:
+                                    reward_extra_metrics[f"train/reward/{eta_key}"] = float(np.mean(vals))
+                except Exception:
+                    pass
+                for key in reward_metric_keys:
+                    if key in batch.non_tensor_batch:
+                        values = batch.non_tensor_batch[key]
+                        if len(values) > 0:
+                            reward_extra_metrics[f"train/reward/{key}"] = float(np.mean(values))
+                
+                if reward_extra_metrics:
+                    metrics.update(reward_extra_metrics)
+                elif OmegaConf.select(self.config, "trainer.compute_entropy_for_reward", default=False):
+                    print(f"[EntropyReward] ⚠️ 警告: 启用了熵奖励但未找到额外指标，batch.non_tensor_batch中的键: {list(batch.non_tensor_batch.keys())}")
 
                 # TODO: make a canonical logger that supports various backend
                 logger.log(data=metrics, step=self.global_steps)
