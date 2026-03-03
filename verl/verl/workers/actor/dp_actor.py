@@ -51,19 +51,24 @@ logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
 
 class SurprisalRedistribution(torch.autograd.Function):
-    """Adaptive entropy-contribution gradient redistribution (positive only).
+    """Entropy-adaptive gradient redistribution (positive-advantage only).
 
-    For positive-advantage samples, blends between standard (∝ p) and
-    entropy-contribution (∝ -p·log p) gradients, with blend factor
-    automatically determined by the target token's probability:
+    Blends standard (∝ p) and entropy-contribution (∝ -p·log p) gradients,
+    with blend strength driven by the competitor entropy H_rest:
 
-        blend = 1 - p_target
-        g_v = blend * g_plogp + (1 - blend) * g_standard
+        H_rest = Σ_{v≠target} p_v · (-log p_v)
+        blend  = H_rest / (H_rest + 1)
 
-    When p_target → 1 (already confident): blend → 0, standard gradient.
-    When p_target → 0 (many competitors): blend → 1, full runner protection.
+    H_rest → 0 (one dominant competitor):  blend → 0, standard gradient.
+    H_rest = 1 (~2.7 effective competitors): blend = 0.5.
+    H_rest → ∞ (many competitors):         blend → 1, full redistribution.
 
-    No hyperparameters. Negative samples use the unmodified standard gradient.
+    Unlike (1 - p_target), this correctly distinguishes a low-p target in
+    a peaked distribution (low H_rest → weak blend) from a low-p target
+    with many genuine competitors (high H_rest → strong blend).
+
+    Zero additional computation: H_rest = w_total, already needed for
+    weight normalization.
 
     Requires inplace_backward=False in downstream logprobs_from_logits.
     """
@@ -107,8 +112,7 @@ class SurprisalRedistribution(torch.autograd.Function):
                 w_at_tgt = w.gather(-1, tgt.unsqueeze(-1))
                 w_total = w.sum(-1, keepdim=True) - w_at_tgt + 1e-10
 
-                p_tgt = torch.exp(z.gather(-1, tgt.unsqueeze(-1)) - lse)
-                blend = 1.0 - p_tgt                                 # adaptive: uncertain → strong
+                blend = w_total / (w_total + 1.0)                   # H_rest-adaptive
 
                 g = grad_output[idx].float()
                 g_tgt = g.gather(-1, tgt.unsqueeze(-1))
@@ -122,7 +126,7 @@ class SurprisalRedistribution(torch.autograd.Function):
                 g_new.scatter_(-1, tgt.unsqueeze(-1), g_tgt)
 
                 grad_output[idx] = g_new.to(grad_output.dtype)
-                del z, lse, surp, w, p_tgt, blend, g, g_plogp, g_new
+                del z, lse, surp, w, blend, g, g_plogp, g_new
 
         return grad_output, None, None
 
