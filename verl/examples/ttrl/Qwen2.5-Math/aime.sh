@@ -62,7 +62,7 @@ BACKBONE_PATH="/data/user5/models/${BACKBONE}"
 REWARD_FUNCTION_PATH="/data/user5/TTRL begin/verl/verl/utils/reward_score/ttrl_math/__init__.py"
 
 MODEL="${TASK}-${BACKBONE}"
-EXPERIMENT="GT-plogpHrest-Len@${K}k"
+EXPERIMENT="GT-surpH-Len@${K}k"
 
 WANDB_PROJECT="TTRL-verl"
 LOG_NAME="${DATE}-${EXPERIMENT}-${MODEL}-${ADVANTAGE}"

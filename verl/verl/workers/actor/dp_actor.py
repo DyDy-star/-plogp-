@@ -51,24 +51,23 @@ logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
 
 class SurprisalRedistribution(torch.autograd.Function):
-    """Entropy-adaptive gradient redistribution (positive-advantage only).
+    """Parameter-free entropy-adaptive gradient redistribution (positive only).
 
-    Blends standard (∝ p) and entropy-contribution (∝ -p·log p) gradients,
-    with blend strength driven by the competitor entropy H_rest:
+    Replaces the standard per-token gradient weight (∝ p) with:
 
-        H_rest = Σ_{v≠target} p_v · (-log p_v)
-        blend  = H_rest / (H_rest + 1)
+        w_v = p_v · surp_v / (surp_v + H)
 
-    H_rest → 0 (one dominant competitor):  blend → 0, standard gradient.
-    H_rest = 1 (~2.7 effective competitors): blend = 0.5.
-    H_rest → ∞ (many competitors):         blend → 1, full redistribution.
+    where surp_v = -log(p_v) and H = Σ p·(-log p) is the distribution entropy.
 
-    Unlike (1 - p_target), this correctly distinguishes a low-p target in
-    a peaked distribution (low H_rest → weak blend) from a low-p target
-    with many genuine competitors (high H_rest → strong blend).
+    Each token's relative surprisal surp_v / (surp_v + H) acts as a
+    smooth, self-normalizing correction factor:
 
-    Zero additional computation: H_rest = w_total, already needed for
-    weight normalization.
+        surp_v ≪ H  (runners, more probable than average) → w ≈ p·surp/H
+        surp_v ≫ H  (tail, less probable than average)   → w ≈ p  (standard)
+        surp_v = H  (average)                             → w = p/2
+
+    The distribution's own entropy H serves as the natural transition scale.
+    No constants, no hyperparameters, no blending.
 
     Requires inplace_backward=False in downstream logprobs_from_logits.
     """
@@ -107,26 +106,23 @@ class SurprisalRedistribution(torch.autograd.Function):
                 z = logits[idx].float()
                 lse = torch.logsumexp(z, dim=-1, keepdim=True)
                 surp = lse - z                                      # -log(p)
-                w = torch.exp(z - lse) * surp                       # -p*log(p), bounded by 1/e
+                p_local = torch.exp(z - lse)
+                H = (p_local * surp).sum(-1, keepdim=True)          # entropy
+                w = p_local * surp / (surp + H + 1e-8)             # self-adaptive
 
                 w_at_tgt = w.gather(-1, tgt.unsqueeze(-1))
                 w_total = w.sum(-1, keepdim=True) - w_at_tgt + 1e-10
-
-                blend = w_total / (w_total + 1.0)                   # H_rest-adaptive
 
                 g = grad_output[idx].float()
                 g_tgt = g.gather(-1, tgt.unsqueeze(-1))
                 g.scatter_(-1, tgt.unsqueeze(-1), 0.0)
                 G_total = g.sum(-1, keepdim=True)
 
-                g_plogp = G_total * w / w_total
-                g_plogp.scatter_(-1, tgt.unsqueeze(-1), 0.0)
-
-                g_new = blend * g_plogp + (1.0 - blend) * g
+                g_new = G_total * w / w_total
                 g_new.scatter_(-1, tgt.unsqueeze(-1), g_tgt)
 
                 grad_output[idx] = g_new.to(grad_output.dtype)
-                del z, lse, surp, w, blend, g, g_plogp, g_new
+                del z, lse, surp, p_local, H, w, g_new
 
         return grad_output, None, None
 
