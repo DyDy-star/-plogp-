@@ -51,23 +51,18 @@ logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
 
 class SurprisalRedistribution(torch.autograd.Function):
-    """Parameter-free entropy-adaptive gradient redistribution (positive only).
+    """Entropy-contribution gradient redistribution (positive-advantage only).
 
-    Replaces the standard per-token gradient weight (∝ p) with:
+    For positive-advantage samples, redistributes non-target gradient
+    proportional to -p·log(p) instead of the standard p:
 
-        w_v = p_v · surp_v / (surp_v + H)
+        g_v = G_total · w_v / w_total,  w_v = p_v · (-log p_v)
 
-    where surp_v = -log(p_v) and H = Σ p·(-log p) is the distribution entropy.
+    -p·log(p) is inherently self-adaptive: bounded by 1/e, peaks at
+    p = 1/e, and vanishes at both p → 0 and p → 1. Runners (high p)
+    get less gradient share than standard → protected during sharpening.
 
-    Each token's relative surprisal surp_v / (surp_v + H) acts as a
-    smooth, self-normalizing correction factor:
-
-        surp_v ≪ H  (runners, more probable than average) → w ≈ p·surp/H
-        surp_v ≫ H  (tail, less probable than average)   → w ≈ p  (standard)
-        surp_v = H  (average)                             → w = p/2
-
-    The distribution's own entropy H serves as the natural transition scale.
-    No constants, no hyperparameters, no blending.
+    Negative-advantage samples use the unmodified standard gradient.
 
     Requires inplace_backward=False in downstream logprobs_from_logits.
     """
@@ -106,9 +101,7 @@ class SurprisalRedistribution(torch.autograd.Function):
                 z = logits[idx].float()
                 lse = torch.logsumexp(z, dim=-1, keepdim=True)
                 surp = lse - z                                      # -log(p)
-                p_local = torch.exp(z - lse)
-                H = (p_local * surp).sum(-1, keepdim=True)          # entropy
-                w = p_local * surp / (surp + H + 1e-8)             # self-adaptive
+                w = torch.exp(z - lse) * surp                       # -p*log(p), bounded by 1/e
 
                 w_at_tgt = w.gather(-1, tgt.unsqueeze(-1))
                 w_total = w.sum(-1, keepdim=True) - w_at_tgt + 1e-10
@@ -122,7 +115,7 @@ class SurprisalRedistribution(torch.autograd.Function):
                 g_new.scatter_(-1, tgt.unsqueeze(-1), g_tgt)
 
                 grad_output[idx] = g_new.to(grad_output.dtype)
-                del z, lse, surp, p_local, H, w, g_new
+                del z, lse, surp, w, g_new
 
         return grad_output, None, None
 

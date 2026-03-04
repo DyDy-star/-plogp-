@@ -2,7 +2,7 @@
 #export VLLM_ATTENTION_BACKEND=XFORMERS
 unset VLLM_ATTENTION_BACKEND
 export VLLM_USE_V1=0
-export CUDA_VISIBLE_DEVICES=4,5,6,7
+export CUDA_VISIBLE_DEVICES=4,5
 
 # ========================================
 # 确保使用正确的代码目录
@@ -26,7 +26,7 @@ echo "✓ HuggingFace 用户名: $HUGGINGFACENAME"
 
 # WandB 配置
 export WANDB_BASE_URL=https://api.bandw.top
-export WANDB_API_KEY="YOUR_WANDB_API_KEY"
+export WANDB_API_KEY="df894ea93af7b822b757e19ee64d9cc6770c0b7e"
 echo "✓ WandB 镜像: $WANDB_BASE_URL"
 # ========================================
 
@@ -62,7 +62,7 @@ BACKBONE_PATH="/data/user5/models/${BACKBONE}"
 REWARD_FUNCTION_PATH="/data/user5/TTRL begin/verl/verl/utils/reward_score/ttrl_math/__init__.py"
 
 MODEL="${TASK}-${BACKBONE}"
-EXPERIMENT="GT-surpH-Len@${K}k"
+EXPERIMENT="GT-plogpPos-Len@${K}k"
 
 WANDB_PROJECT="TTRL-verl"
 LOG_NAME="${DATE}-${EXPERIMENT}-${MODEL}-${ADVANTAGE}"
@@ -124,7 +124,7 @@ python -m verl.trainer.main_ppo \
   trainer.logger=['console','wandb'] \
   trainer.project_name=$WANDB_PROJECT \
   trainer.experiment_name=$LOG_NAME \
-  trainer.n_gpus_per_node=4 \
+  trainer.n_gpus_per_node=2 \
   trainer.nnodes=1 \
   trainer.save_freq=2000000 \
   trainer.test_freq=2 \
