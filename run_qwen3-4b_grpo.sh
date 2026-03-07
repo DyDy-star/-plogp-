@@ -1,5 +1,14 @@
 export RAY_DEDUP_LOGS=0
 
+# HuggingFace 配置
+export HF_ENDPOINT=https://hf-mirror.com
+export HUGGINGFACENAME="123YYY123"
+export HF_TOKEN="YOUR_HF_TOKEN"
+
+# WandB 配置
+export WANDB_BASE_URL=https://api.bandw.top
+export WANDB_API_KEY="YOUR_WANDB_API_KEY"
+
 math_train_path=./data/math/train.parquet
 math_test_path=./data/math/test.parquet
 aime2025_test_path=./data/aime2025/test.parquet
@@ -43,7 +52,7 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.rollout.gpu_memory_utilization=0.7 \
     actor_rollout_ref.rollout.n=8 \
     actor_rollout_ref.ref.fsdp_config.param_offload=True \
-    trainer.experiment_name="MATH-Qwen3-4B-GRPO" \
+    trainer.experiment_name="MATH-Qwen3-4B-GRPO-SurpRedist" \
     trainer.critic_warmup=0 \
     trainer.logger=['wandb'] \
     trainer.project_name='verl' \
@@ -52,4 +61,5 @@ python3 -m verl.trainer.main_ppo \
     trainer.nnodes=1 \
     trainer.save_freq=7 \
     trainer.test_freq=7 \
+    ++actor_rollout_ref.actor.use_surprisal_redistribution=True \
     trainer.total_epochs=20 $@

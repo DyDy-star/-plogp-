@@ -20,7 +20,10 @@ from typing import Union
 from sympy import simplify, N
 from sympy.parsing.sympy_parser import parse_expr
 from sympy.parsing.latex import parse_latex
-from latex2sympy2 import latex2sympy
+try:
+    from latex2sympy2_extended import latex2sympy
+except ImportError:
+    from latex2sympy2 import latex2sympy
 
 def parse_digits(num):
     num = regex.sub(',', '', str(num))

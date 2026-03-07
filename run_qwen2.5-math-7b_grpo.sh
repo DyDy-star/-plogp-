@@ -1,4 +1,14 @@
 export RAY_DEDUP_LOGS=0
+export CUDA_VISIBLE_DEVICES=4,5,6,7
+
+# HuggingFace 配置
+export HF_ENDPOINT=https://hf-mirror.com
+export HUGGINGFACENAME="123YYY123"
+export HF_TOKEN="YOUR_HF_TOKEN"
+
+# WandB 配置
+export WANDB_BASE_URL=https://api.bandw.top
+export WANDB_API_KEY="YOUR_WANDB_API_KEY"
 
 math_train_path=./data/math/train.parquet
 math_test_path=./data/math/test.parquet
@@ -9,7 +19,7 @@ train_files="['$math_train_path']"
 test_files="['$math_test_path', '$aime2025_test_path', '$amc23_test_path']"
 kl_coef=0.001
 lr=1e-6
-model_name=Qwen/Qwen2.5-Math-7B
+model_name=/data/user5/models/Qwen2.5-Math-7B
 
 python3 -m verl.trainer.main_ppo \
     algorithm.adv_estimator=grpo \
@@ -25,9 +35,9 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.model.use_remove_padding=True \
     actor_rollout_ref.model.enable_gradient_checkpointing=True \
     actor_rollout_ref.actor.use_dynamic_bsz=True \
-    actor_rollout_ref.actor.ppo_max_token_len_per_gpu=48000 \
-    actor_rollout_ref.rollout.log_prob_max_token_len_per_gpu=64000 \
-    actor_rollout_ref.ref.log_prob_max_token_len_per_gpu=64000 \
+    actor_rollout_ref.actor.ppo_max_token_len_per_gpu=24000 \
+    actor_rollout_ref.rollout.log_prob_max_token_len_per_gpu=32000 \
+    actor_rollout_ref.ref.log_prob_max_token_len_per_gpu=32000 \
     actor_rollout_ref.actor.ppo_mini_batch_size=256 \
     actor_rollout_ref.actor.use_kl_loss=True \
     actor_rollout_ref.actor.kl_loss_coef=$kl_coef \
@@ -41,13 +51,14 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.rollout.gpu_memory_utilization=0.7 \
     actor_rollout_ref.rollout.n=8 \
     actor_rollout_ref.ref.fsdp_config.param_offload=True \
-    trainer.experiment_name="MATH-Qwen2.5-Math-7B-GRPO" \
+    trainer.experiment_name="MATH-Qwen2.5-Math-7B-GRPO-SurpRedist" \
     trainer.critic_warmup=0 \
     trainer.logger=['wandb'] \
     trainer.project_name='verl' \
-    trainer.n_gpus_per_node=8 \
+    trainer.n_gpus_per_node=4 \
     +trainer.val_before_train=True \
     trainer.nnodes=1 \
     trainer.save_freq=7 \
     trainer.test_freq=7 \
+    ++actor_rollout_ref.actor.use_surprisal_redistribution=True \
     trainer.total_epochs=20 $@

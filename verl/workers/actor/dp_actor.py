@@ -36,6 +36,70 @@ from flash_attn.bert_padding import pad_input, unpad_input, rearrange, index_fir
 __all__ = ['DataParallelPPOActor']
 
 
+class SurprisalRedistribution(torch.autograd.Function):
+    """Entropy-contribution gradient redistribution (positive-advantage only).
+
+    For positive-advantage samples, redistributes non-target gradient
+    proportional to -p·log(p) instead of the standard p:
+
+        g_v = G_total · w_v / w_total,  w_v = p_v · (-log p_v)
+
+    Negative-advantage samples use the unmodified standard gradient.
+    """
+
+    _CHUNK = 128
+
+    @staticmethod
+    def forward(ctx, logits, target_ids, advantages):
+        active = (advantages > 0).nonzero(as_tuple=True)[0]
+        n_active = len(active)
+
+        if n_active > 0:
+            ctx.save_for_backward(logits)
+            ctx.active_indices = active.detach()
+            ctx.active_targets = target_ids[active].detach()
+        else:
+            ctx.save_for_backward(logits[:0])
+
+        ctx.n_active = n_active
+        return logits
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        if ctx.n_active == 0:
+            return grad_output, None, None
+
+        (logits,) = ctx.saved_tensors
+        chunk = SurprisalRedistribution._CHUNK
+
+        for s in range(0, ctx.n_active, chunk):
+            e = min(s + chunk, ctx.n_active)
+            idx = ctx.active_indices[s:e]
+            tgt = ctx.active_targets[s:e]
+
+            with torch.no_grad():
+                z = logits[idx].float()
+                lse = torch.logsumexp(z, dim=-1, keepdim=True)
+                surp = lse - z
+                w = torch.exp(z - lse) * surp
+
+                w_at_tgt = w.gather(-1, tgt.unsqueeze(-1))
+                w_total = w.sum(-1, keepdim=True) - w_at_tgt + 1e-10
+
+                g = grad_output[idx].float()
+                g_tgt = g.gather(-1, tgt.unsqueeze(-1))
+                g.scatter_(-1, tgt.unsqueeze(-1), 0.0)
+                G_total = g.sum(-1, keepdim=True)
+
+                g_new = G_total * w / w_total
+                g_new.scatter_(-1, tgt.unsqueeze(-1), g_tgt)
+
+                grad_output[idx] = g_new.to(grad_output.dtype)
+                del z, lse, surp, w, g_new
+
+        return grad_output, None, None
+
+
 class DataParallelPPOActor(BasePPOActor):
 
     def __init__(
@@ -55,7 +119,7 @@ class DataParallelPPOActor(BasePPOActor):
 
         self.compute_entropy_from_logits = torch.compile(verl_F.entropy_from_logits, dynamic=True)
 
-    def _forward_micro_batch(self, micro_batch, temperature) -> Tuple[torch.Tensor, torch.Tensor]:
+    def _forward_micro_batch(self, micro_batch, temperature, surprisal_config=None) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Returns: 
             entropy: # (bs, response_len)
@@ -113,6 +177,16 @@ class DataParallelPPOActor(BasePPOActor):
 
                 logits_rmpad.div_(temperature)
 
+                if surprisal_config is not None and not self.use_ulysses_sp:
+                    adv = surprisal_config["advantages"]
+                    adv_full = torch.zeros(batch_size, seqlen, device=logits_rmpad.device,
+                                           dtype=logits_rmpad.dtype)
+                    adv_full[:, -response_length - 1:-1] = adv.to(logits_rmpad.dtype)
+                    adv_rmpad = adv_full.reshape(-1)[indices]
+                    logits_rmpad = SurprisalRedistribution.apply(
+                        logits_rmpad, input_ids_rmpad_rolled, adv_rmpad,
+                    )
+
                 # compute entropy
                 entropy_rmpad = self.compute_entropy_from_logits(logits_rmpad)  # ((total_nnz / sp) + pad)
 
@@ -150,6 +224,17 @@ class DataParallelPPOActor(BasePPOActor):
                 logits = output.logits
                 logits.div_(temperature)
                 logits = logits[:, -response_length - 1:-1, :]  # (bsz, response_length, vocab_size)
+
+                if surprisal_config is not None:
+                    B, T, V = logits.shape
+                    logits_flat = logits.reshape(B * T, V)
+                    target_flat = micro_batch['responses'].reshape(B * T)
+                    adv_flat = surprisal_config["advantages"].reshape(B * T).to(logits_flat.dtype)
+                    logits_flat = SurprisalRedistribution.apply(
+                        logits_flat, target_flat, adv_flat,
+                    )
+                    logits = logits_flat.reshape(B, T, V)
+
                 log_probs = logprobs_from_logits(logits, micro_batch['responses'])
                 entropy = verl_F.entropy_from_logits(logits)  # (bsz, response_length)
 
@@ -267,6 +352,7 @@ class DataParallelPPOActor(BasePPOActor):
                     micro_batches = mini_batch.split(self.config.ppo_micro_batch_size_per_gpu)
 
                 self.actor_optimizer.zero_grad()
+                _use_surprisal = self.config.get("use_surprisal_redistribution", False)
 
                 for data in micro_batches:
                     # Support all hardwares
@@ -285,8 +371,13 @@ class DataParallelPPOActor(BasePPOActor):
                     entropy_coeff = self.config.entropy_coeff
                     positive_learning_weight = self.config.positive_learning_weight
 
+                    surprisal_config = None
+                    if _use_surprisal:
+                        surprisal_config = {"advantages": advantages}
+
                     # all return: (bsz, response_length)
-                    entropy, log_prob = self._forward_micro_batch(micro_batch=data, temperature=temperature)
+                    entropy, log_prob = self._forward_micro_batch(micro_batch=data, temperature=temperature,
+                                                                  surprisal_config=surprisal_config)
 
                     pg_loss, pg_clipfrac, ppo_kl = core_algos.compute_policy_loss(old_log_prob=old_log_prob,
                                                                                   log_prob=log_prob,
